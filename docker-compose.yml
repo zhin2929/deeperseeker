@@ -6,13 +6,11 @@ services:
       - "127.0.0.1:4000:4000"
     environment:
       - HOST=0.0.0.0
+      - DEEPSEEKER_DATA_DIR=/app/data
     env_file:
       - path: .env
         required: false
     volumes:
-      - deeperseeker_data:/app/data
+      - ./:/app
     shm_size: "1gb"
     restart: unless-stopped
-
-volumes:
-  deeperseeker_data:

@@ -92,7 +92,7 @@ cp .env.example .env
   - `POST /v1/messages` (also at `/messages`)
   - `POST /v1/files/upload`
 - **Auth Key**: Configured in `.env` (`DEEPSEEKER_API_KEY`)
-- **Models**: `instant` (flash), `vision` (flash + vision), `expert` (pro) — also exposed as `anthropic/claude-instant`, `anthropic/claude-vision`, `anthropic/claude-expert` aliases for Claude Desktop auto-discovery. If no `model` is sent, requests default to `expert`.
+- **Models**: `DeepSeek-V4-Flash-Vision-Exp` (default, fast + vision), `DeepSeek-V4-Flash` (fast), and `DeepSeek-V4-Pro` (expert). If no `model` is sent, requests default to `DeepSeek-V4-Flash-Vision-Exp`.
 
 ## Features
 
@@ -114,7 +114,7 @@ cp .env.example .env
 | **DeepSeek V4 Pro** (flagship, coding, reasoning) | Off-Peak Hours | $0.66 | $1.32 |
 | | Peak Hours | $1.32 | $1.98 |
 
-Model mapping: `instant`/`vision` → V4 Flash, `expert` → V4 Pro. The `cost` reported in API responses uses the flat Peak Hour rates.
+Model mapping: `DeepSeek-V4-Flash-Vision-Exp` → vision/flash, `DeepSeek-V4-Flash` → flash, and `DeepSeek-V4-Pro` → pro. The `cost` reported in API responses uses the flat Peak Hour rates.
 ## Star History
 
 <a href="https://www.star-history.com/?repos=amancode22%2Fdeeperseeker&type=date&legend=top-left">

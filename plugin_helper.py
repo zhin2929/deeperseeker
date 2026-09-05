@@ -29,10 +29,11 @@ async def extract_tools(tools):
     final_tools = []
     for i in tools:
         if i.get("type") == "function":
-            fn = i.get("function", {})
+            # Responses uses a flat function definition; Chat Completions nests it.
+            fn = i.get("function") if isinstance(i.get("function"), dict) else i
             name = fn.get("name", "")
             desc = fn.get("description", "")
-            params = fn.get("parameters", {})
+            params = fn.get("parameters", fn.get("input_schema", {}))
             final_tools.append(f"Tool: {name}\nDescription: {desc}\nParameters: {json.dumps(params)}")
         elif "name" in i:
             name = i.get("name", "")
@@ -94,6 +95,13 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
             if messages[idx].get("role") == "user":
                 scan = messages[idx:]
                 break
+    async def upload_bytes(data, filename, mime_type):
+        if not data or len(data) > 20 * 1024 * 1024:
+            return
+        async for result in upload_file(data, filename or "upload.bin", mime_type or "application/octet-stream", auth_token):
+            if result[0] == "success":
+                result_fileids.append(result[1]["file_id"])
+
     for idx, i in enumerate(scan):
         content = i.get("content")
         if not content:
@@ -101,87 +109,79 @@ async def extract_and_upload_files(messages, auth_token, last_user_only=False):
         if isinstance(content, str):
             continue
         for j_idx, j in enumerate(content):
-            if j["type"] == "text":
+            if not isinstance(j, dict):
                 continue
-            elif j["type"] == "image_url":
-                if j["image_url"]["url"].startswith("http"):
-                    _assert_public_url(j["image_url"]["url"])
-                    url_path = urlsplit(j["image_url"]["url"]).path
+            item_type = j.get("type")
+            if item_type == "text":
+                continue
+            elif item_type == "image_url":
+                image_url = j.get("image_url", {}).get("url") if isinstance(j.get("image_url"), dict) else j.get("image_url")
+                if not image_url:
+                    continue
+                if image_url.startswith("http"):
+                    _assert_public_url(image_url)
+                    url_path = urlsplit(image_url).path
                     filename = Path(url_path).name
                     mime_type, _ = mimetypes.guess_type(filename)
                     session = await get_session()
-                    async with session.get(j["image_url"]["url"]) as resp:
+                    async with session.get(image_url) as resp:
                         file_bytes = await resp.content.read(20 * 1024 * 1024 + 1)
-                    if len(file_bytes) > 20 * 1024 * 1024:
-                        continue
-
-                    async for k in upload_file(file_bytes, filename, mime_type, auth_token):
-                        if k[0] == "uploaded":
-                            continue
-                        elif k[0] == "success":
-                            result_fileids.append(k[1]["file_id"])
+                    await upload_bytes(file_bytes, filename, mime_type or "image/*")
 
                 else:
-                    url_parts = j["image_url"]["url"].split(",", 1)
+                    url_parts = image_url.split(",", 1)
                     if len(url_parts) != 2:
                         continue
                     mimetype_base, base64_data = url_parts
-                    mime_type = mimetype_base.split(":")[1].split(";")[0]
+                    mime_type = mimetype_base.split(":", 1)[1].split(";", 1)[0] if ":" in mimetype_base else "application/octet-stream"
                     filename = (
                         "inline_uploaded_"
                         + str(uuid.uuid4())
                         + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
                     data_bytes = _b64(
-                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data)
+                        base64_data
                     )
-                    if data_bytes is None:
-                        continue
-                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
-                        if k[0] == "uploaded":
-                            continue
-                        elif k[0] == "success":
-                            result_fileids.append(k[1]["file_id"])
-            elif j["type"] == "file":
-                if "file_id" in j["file"]:
-                    result_fileids.append(j["file"]["file_id"])
-                if "file_data" in j["file"]:
-                    filename = j["file"]["filename"]
-                    data_parts = j["file_data"].split(",", 1)
+                    await upload_bytes(data_bytes, filename, mime_type)
+            elif item_type == "file":
+                file_obj = j.get("file") if isinstance(j.get("file"), dict) else j
+                if file_obj.get("file_id"):
+                    result_fileids.append(file_obj["file_id"])
+                file_data = file_obj.get("file_data")
+                if file_data:
+                    filename = file_obj.get("filename") or ("inline_uploaded_" + str(uuid.uuid4()))
+                    data_parts = file_data.split(",", 1)
                     if len(data_parts) != 2:
                         continue
                     mimetype_base, base64_data = data_parts
 
-                    mime_type = mimetype_base.split(":")[1].split(";")[0]
+                    mime_type = mimetype_base.split(":", 1)[1].split(";", 1)[0] if ":" in mimetype_base else "application/octet-stream"
                     data_bytes = _b64(
-                        (base64_data.split("data:")[1] if "data:" in base64_data else base64_data)
+                        base64_data
                     )
-                    if data_bytes is None:
-                        continue
-                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
-                        if k[0] == "uploaded":
-                            continue
-                        elif k[0] == "success":
-                            result_fileids.append(k[1]["file_id"])
-            elif j["type"] == "document" or j["type"] == "image":
-                if j["source"]["type"] == "base64":
-                    base64_data = j["source"]["data"].split(",")[1] if "," in j["source"]["data"] else j["source"]["data"]
-                    mime_type = j["source"]["media_type"]
+                    await upload_bytes(data_bytes, filename, mime_type)
+                elif file_obj.get("file_url"):
+                    file_url = file_obj["file_url"]
+                    _assert_public_url(file_url)
+                    filename = file_obj.get("filename") or Path(urlsplit(file_url).path).name or "remote_file"
+                    session = await get_session()
+                    async with session.get(file_url) as resp:
+                        data_bytes = await resp.content.read(20 * 1024 * 1024 + 1)
+                    await upload_bytes(data_bytes, filename, mimetypes.guess_type(filename)[0])
+            elif item_type in {"document", "image"} and isinstance(j.get("source"), dict):
+                source = j["source"]
+                if source.get("type") == "base64":
+                    base64_data = source.get("data", "").split(",", 1)[-1]
+                    mime_type = source.get("media_type", "application/octet-stream")
                     filename = (
                         "inline_uploaded_"
                         + str(uuid.uuid4())
                         + (mimetypes.guess_extension(mime_type) or ".bin")
                     )
                     data_bytes = _b64(base64_data)
-                    if data_bytes is None:
-                        continue
-                    async for k in upload_file(data_bytes, filename, mime_type, auth_token):
-                        if k[0] == "uploaded":
-                            continue
-                        elif k[0] == "success":
-                            result_fileids.append(k[1]["file_id"])
-                elif j["source"]["type"] == "file":
-                    result_fileids.append(j["source"]["file_id"])
+                    await upload_bytes(data_bytes, filename, mime_type)
+                elif source.get("type") == "file" and source.get("file_id"):
+                    result_fileids.append(source["file_id"])
     return result_fileids
 
 

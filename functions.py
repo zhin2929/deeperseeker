@@ -17,7 +17,11 @@ from playwright.async_api import async_playwright
 
 wasm_path = "wasm/deepseek_pow_solver.wasm"
 _session = None
-_db = "deeperseeker.db"
+_data_dir = os.getenv("DEEPSEEKER_DATA_DIR", "").strip()
+if _data_dir:
+    os.makedirs(_data_dir, exist_ok=True)
+_db = os.path.join(_data_dir, "deeperseeker.db") if _data_dir else "deeperseeker.db"
+_cookie_file = os.path.join(_data_dir, "aws_cookies_deepseek.json") if _data_dir else "aws_cookies_deepseek.json"
 
 try:
     _TZ_OFFSET = str(int(datetime.now().astimezone().utcoffset().total_seconds()))
@@ -101,8 +105,8 @@ _cookie_lock = asyncio.Lock()
 
 async def get_cookies():
     try:
-        if os.path.exists("aws_cookies_deepseek.json"):
-            with open("aws_cookies_deepseek.json") as f:
+        if os.path.exists(_cookie_file):
+            with open(_cookie_file) as f:
                 cookies = json.load(f)
             if cookies.get("expiry") is not None and cookies["expiry"] > time.time():
                 return cookies["cookie"]
@@ -111,15 +115,15 @@ async def get_cookies():
     async with _cookie_lock:
         fresh = False
         try:
-            if os.path.exists("aws_cookies_deepseek.json"):
-                with open("aws_cookies_deepseek.json") as f:
+            if os.path.exists(_cookie_file):
+                with open(_cookie_file) as f:
                     cookies = json.load(f)
                 fresh = cookies.get("expiry") is not None and cookies["expiry"] > time.time()
         except Exception:
             fresh = False
         if not fresh:
             await _generate_cookies()
-        with open("aws_cookies_deepseek.json") as f:
+        with open(_cookie_file) as f:
             cookies = json.load(f)
         return cookies["cookie"]
 
@@ -151,10 +155,10 @@ async def _generate_cookies():
     final_cookies["ds_cookie_preference"] = "%257B%2522level%2522%253A%2522all%2522%257D"
     if not expiry or expiry < 0:
         expiry = time.time() + 1800
-    tmp_path = "aws_cookies_deepseek.json.tmp"
+    tmp_path = f"{_cookie_file}.tmp"
     with open(tmp_path, "w") as f:
         f.write(json.dumps({"cookie": final_cookies, "expiry": expiry}))
-    os.replace(tmp_path, "aws_cookies_deepseek.json")
+    os.replace(tmp_path, _cookie_file)
 
 
 def get_auth_token():
@@ -530,6 +534,46 @@ def parse_tools(text):
     return tools, clean_text
 
 
+_STREAM_TOOL_START_TAGS = [
+    "<｜｜DSML｜｜tool_calls",
+    "<｜｜DSML｜｜tool_call",
+    "<｜｜DSML｜｜function_call",
+    "<｜｜DSML｜｜invoke",
+    "<||DSML||tool_calls",
+    "<||DSML||tool_call",
+    "<||DSML||function_call",
+    "<||DSML||invoke",
+    "<tool_calls",
+    "<tool_call",
+    "<function_call",
+    "<invoke",
+]
+_STREAM_TOOL_END_TAGS = [
+    "</｜｜DSML｜｜tool_calls>",
+    "</｜｜DSML｜｜tool_call>",
+    "</｜｜DSML｜｜function_call>",
+    "</｜｜DSML｜｜invoke>",
+    "</||DSML||tool_calls>",
+    "</||DSML||tool_call>",
+    "</||DSML||function_call>",
+    "</||DSML||invoke>",
+    "</tool_calls>",
+    "</tool_call>",
+    "</function_call>",
+    "</invoke>",
+]
+_STREAM_TOOL_MARKUP_RE = re.compile(
+    r"</?(?:[｜|]{0,2}(?:DSML[｜|]{0,2})?)(?:tool_calls?|invoke|function_call|parameter|param)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _stream_text_result(text):
+    """Remove tool markup that can remain after a nested DSML block closes."""
+    cleaned = _STREAM_TOOL_MARKUP_RE.sub("", text)
+    return {"text": cleaned} if cleaned else None
+
+
 class StreamToolParser:
     def __init__(self):
         self.buffer = ""
@@ -542,7 +586,7 @@ class StreamToolParser:
         results = []
         while True:
             if self.in_tool:
-                end_tags = ["</tool_call>", "</function_call>", "</invoke>", "</tool_calls>"]
+                end_tags = _STREAM_TOOL_END_TAGS
                 end_pos = -1
                 end_tag_len = 0
                 for tag in end_tags:
@@ -575,7 +619,21 @@ class StreamToolParser:
                         pass
                 break
             else:
-                start_tags = ["<tool_call", "<function_call", "<invoke", "<tool_calls"]
+                start_tags = _STREAM_TOOL_START_TAGS
+                end_pos = -1
+                end_tag_len = 0
+                for tag in _STREAM_TOOL_END_TAGS:
+                    idx = self.buffer.find(tag)
+                    if idx != -1 and (end_pos == -1 or idx < end_pos):
+                        end_pos = idx
+                        end_tag_len = len(tag)
+                if end_pos != -1:
+                    if end_pos > 0:
+                        text_result = _stream_text_result(self.buffer[:end_pos])
+                        if text_result:
+                            results.append(text_result)
+                    self.buffer = self.buffer[end_pos + end_tag_len:]
+                    continue
                 start_pos = -1
                 for tag in start_tags:
                     idx = self.buffer.find(tag)
@@ -583,24 +641,30 @@ class StreamToolParser:
                         start_pos = idx
                 if start_pos != -1:
                     if start_pos > 0:
-                        results.append({"text": self.buffer[:start_pos]})
+                        text_result = _stream_text_result(self.buffer[:start_pos])
+                        if text_result:
+                            results.append(text_result)
                     self.buffer = self.buffer[start_pos:]
                     self.in_tool = True
                     self.has_tool = True
                     continue
                 hold = 0
-                for tag in start_tags:
+                for tag in start_tags + _STREAM_TOOL_END_TAGS:
                     for i in range(1, len(tag)):
                         if self.buffer.endswith(tag[:i]):
                             hold = max(hold, i)
                 if hold:
                     text_part = self.buffer[:-hold]
                     if text_part:
-                        results.append({"text": text_part})
+                        text_result = _stream_text_result(text_part)
+                        if text_result:
+                            results.append(text_result)
                     self.buffer = self.buffer[-hold:]
                 else:
                     if self.buffer:
-                        results.append({"text": self.buffer})
+                        text_result = _stream_text_result(self.buffer)
+                        if text_result:
+                            results.append(text_result)
                     self.buffer = ""
                 break
         return results
@@ -608,9 +672,11 @@ class StreamToolParser:
     def flush(self):
         out = []
         if self.buffer and not self.in_tool:
-            out.append({"text": self.buffer})
+            text_result = _stream_text_result(self.buffer)
+            if text_result:
+                out.append(text_result)
         elif self.in_tool:
-            stripped = re.sub(r"</?[｜\|]{0,2}(?:DSML[｜\|]{0,2})?(?:tool_call|invoke|function_call|parameter)[^>]*>", "", self.buffer, flags=re.IGNORECASE).strip()
+            stripped = _STREAM_TOOL_MARKUP_RE.sub("", self.buffer).strip()
             if stripped:
                 out.append({"text": stripped})
         self.buffer = ""

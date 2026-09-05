@@ -31,11 +31,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium --with-deps || playwright install chromium
 
-COPY . .
-
-RUN mkdir -p /app/data && \
-    ln -sf /app/data/deeperseeker.db /app/deeperseeker.db && \
-    ln -sf /app/data/aws_cookies_deepseek.json /app/aws_cookies_deepseek.json
+RUN mkdir -p /app/data
 
 EXPOSE 4000
 
